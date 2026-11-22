@@ -205,6 +205,7 @@ import {
     createTagMapFromList,
     renameTagKey,
     importTags,
+    importTagsForCharacters,
     tag_filter_type,
     compareTagsForSort,
     initTags,
@@ -8503,13 +8504,13 @@ export async function getChatsFromFiles(data, isGroupChat) {
  * in descending order by file name. Returns an empty array if the fetch request is unsuccessful or the
  * response is an object with an `error` property set to `true`.
  */
-export async function getPastCharacterChats(characterId = null) {
+export async function getPastCharacterChats(characterId = null, { simple = false } = {}) {
     characterId = characterId ?? parseInt(this_chid);
     if (!characters[characterId]) return [];
 
     const response = await fetch('/api/characters/chats', {
         method: 'POST',
-        body: JSON.stringify({ avatar_url: characters[characterId].avatar }),
+        body: JSON.stringify({ avatar_url: characters[characterId].avatar, simple }),
         headers: getRequestHeaders(),
     });
 
@@ -10473,23 +10474,94 @@ export async function processDroppedFiles(files, data = new Map()) {
         'byaf',
     ];
 
-    const avatarFileNames = [];
+    const supportedFiles = [];
+    const unsupportedNames = [];
     for (const file of files) {
         const extension = file.name.split('.').pop().toLowerCase();
         if (allowedMimeTypes.some(x => file.type.startsWith(x)) || allowedExtensions.includes(extension)) {
-            const preservedName = data instanceof Map && data.get(file);
-            const avatarFileName = await importCharacter(file, { preserveFileName: preservedName });
-            if (avatarFileName !== undefined) {
-                avatarFileNames.push(avatarFileName);
-            }
+            supportedFiles.push(file);
         } else {
-            toastr.warning(t`Unsupported file type: ` + file.name);
+            unsupportedNames.push(file.name);
         }
     }
 
+    if (unsupportedNames.length > 0) {
+        console.warn('Unsupported files skipped during import', unsupportedNames);
+        toastr.warning(t`Unsupported file type: ` + summarizeNames(unsupportedNames));
+    }
+
+    await importCharacterFiles(supportedFiles, data);
+}
+
+/**
+ * Shortens a list of names for display in a single toast.
+ * @param {string[]} names Names to list
+ * @param {number} [limit=5] How many names to show before summarizing the rest
+ * @returns {string} Comma-separated names
+ */
+function summarizeNames(names, limit = 5) {
+    const shown = names.slice(0, limit).join(', ');
+    return names.length > limit ? `${shown} ${t`and ${names.length - limit} more`}` : shown;
+}
+
+/**
+ * Imports character files one at a time, then their tags. Multiple files share one progress
+ * toast and one summary instead of notifying per file. Uploads stay sequential on purpose:
+ * the server picks a free file name before writing, so same-named cards must not overlap.
+ * @param {File[]} files Files to import
+ * @param {Map<File, string>} [data] Preserved file names, by file
+ * @returns {Promise<void>}
+ */
+async function importCharacterFiles(files, data = new Map()) {
+    const isBatch = files.length > 1;
+    const avatarFileNames = [];
+    const failedNames = [];
+    let stopRequested = false;
+
+    const loaderHandle = isBatch ? loader.show({
+        blocking: false,
+        slug: 'bulk-import',
+        title: t`Bulk Import`,
+        message: t`Importing 1 of ${files.length} characters…`,
+        stopTooltip: t`Stop importing`,
+        onStop: () => { stopRequested = true; },
+    }) : loader.Handle.EMPTY;
+
+    try {
+        for (const [index, file] of files.entries()) {
+            if (stopRequested) break;
+            loaderHandle.setMessage(t`Importing ${index + 1} of ${files.length} characters…`);
+
+            const preservedName = data instanceof Map && data.get(file);
+            const avatarFileName = await importCharacter(file, { preserveFileName: preservedName, quiet: isBatch });
+            if (avatarFileName !== undefined) {
+                avatarFileNames.push(avatarFileName);
+            } else {
+                failedNames.push(file.name);
+            }
+        }
+    } finally {
+        await loaderHandle.hide();
+    }
+
     if (avatarFileNames.length > 0) {
+        if (isBatch) $('#character_search_bar').val('').trigger('input');
         await importCharactersTags(avatarFileNames);
         selectImportedChar(avatarFileNames[avatarFileNames.length - 1]);
+    }
+
+    if (isBatch) {
+        const notAttempted = files.length - avatarFileNames.length - failedNames.length;
+        if (avatarFileNames.length > 0) {
+            toastr.success(t`Imported ${avatarFileNames.length} of ${files.length} characters`, t`Bulk Import`);
+        }
+        if (notAttempted > 0) {
+            toastr.info(t`Stopped before importing ${notAttempted} characters`, t`Bulk Import`);
+        }
+        if (failedNames.length > 0) {
+            console.error('Character files that could not be imported', failedNames);
+            toastr.error(summarizeNames(failedNames), t`Could not import ${failedNames.length} files`, { timeOut: 0, extendedTimeOut: 0 });
+        }
     }
 }
 
@@ -10499,6 +10571,13 @@ export async function processDroppedFiles(files, data = new Map()) {
  */
 async function importCharactersTags(avatarFileNames) {
     await getCharacters();
+
+    if (avatarFileNames.length > 1) {
+        const charactersByAvatar = new Map(characters.map(character => [character.avatar, character]));
+        await importTagsForCharacters(avatarFileNames.map(avatar => charactersByAvatar.get(avatar)).filter(Boolean));
+        return;
+    }
+
     for (let i = 0; i < avatarFileNames.length; i++) {
         if (power_user.tag_import_setting !== tag_import_setting.NONE) {
             const importedCharacter = characters.find(character => character.avatar === avatarFileNames[i]);
@@ -10525,9 +10604,10 @@ function selectImportedChar(charId) {
  * @param {object} [options] - Options
  * @param {string} [options.preserveFileName] Whether to preserve original file name
  * @param {Boolean} [options.importTags=false] Whether to import tags
+ * @param {Boolean} [options.quiet=false] Skip per-file toasts and UI updates, because the caller reports a summary
  * @returns {Promise<string>}
  */
-async function importCharacter(file, { preserveFileName = '', importTags = false } = {}) {
+async function importCharacter(file, { preserveFileName = '', importTags = false, quiet = false } = {}) {
     if (is_group_generating || is_send_press) {
         toastr.error(t`Cannot import characters while generating. Stop the request and try again.`, t`Import aborted`);
         throw new Error('Cannot import character while generating');
@@ -10574,12 +10654,14 @@ async function importCharacter(file, { preserveFileName = '', importTags = false
                 await fetch(getThumbnailUrl('avatar', avatarFileName), { cache: 'reload' });
             }
 
-            $('#character_search_bar').val('').trigger('input');
+            if (!quiet) {
+                $('#character_search_bar').val('').trigger('input');
 
-            if (exists) {
-                toastr.success(t`Character Replaced: ${String(data.file_name).replace('.png', '')}`);
-            } else {
-                toastr.success(t`Character Created: ${String(data.file_name).replace('.png', '')}`);
+                if (exists) {
+                    toastr.success(t`Character Replaced: ${String(data.file_name).replace('.png', '')}`);
+                } else {
+                    toastr.success(t`Character Created: ${String(data.file_name).replace('.png', '')}`);
+                }
             }
             if (importTags) {
                 await importCharactersTags([avatarFileName]);
@@ -10589,7 +10671,9 @@ async function importCharacter(file, { preserveFileName = '', importTags = false
         }
     } catch (error) {
         console.error('Error importing character', error);
-        toastr.error(t`The file is likely invalid or corrupted.`, t`Could not import character`);
+        if (!quiet) {
+            toastr.error(t`The file is likely invalid or corrupted.`, t`Could not import character`);
+        }
     }
 }
 
@@ -10823,12 +10907,17 @@ export async function handleDeleteCharacter(this_chid, delete_chats) {
  * @param {string|string[]} characterKey - The key (avatar) of the character to be deleted
  * @param {Object} [options] - Optional parameters for the deletion
  * @param {boolean} [options.deleteChats=true] - Whether to delete associated chats or not
+ * @param {((done: number, total: number) => void)?} [options.onProgress=null] - Called after each processed character
  * @return {Promise<boolean>} - A promise that resolves when the character is successfully deleted
  */
-export async function deleteCharacter(characterKey, { deleteChats = true } = {}) {
+export async function deleteCharacter(characterKey, { deleteChats = true, onProgress = null } = {}) {
     if (!Array.isArray(characterKey)) {
         characterKey = [characterKey];
     }
+
+    const isBatch = characterKey.length > 1;
+    const failedNames = [];
+    let deletedCount = 0;
 
     const inTempChat = this_chid === undefined && name2 === neutralCharacterName;
     if (inTempChat) {
@@ -10848,15 +10937,19 @@ export async function deleteCharacter(characterKey, { deleteChats = true } = {})
 
     let deleted = false;
 
-    for (const key of characterKey) {
+    for (const [index, key] of characterKey.entries()) {
+        onProgress?.(index + 1, characterKey.length);
+
         const character = characters.find(x => x.avatar == key);
         if (!character) {
-            toastr.warning(t`Character ${key} not found. Skipping deletion.`);
+            if (isBatch) failedNames.push(String(key));
+            else toastr.warning(t`Character ${key} not found. Skipping deletion.`);
             continue;
         }
 
         const chid = characters.indexOf(character);
-        const pastChats = await getPastCharacterChats(chid);
+        // Chat names are only needed to announce deleted chats, so don't read them otherwise
+        const pastChats = deleteChats ? await getPastCharacterChats(chid, { simple: true }) : [];
 
         const msg = { avatar_url: character.avatar, delete_chats: deleteChats };
 
@@ -10868,7 +10961,8 @@ export async function deleteCharacter(characterKey, { deleteChats = true } = {})
         });
 
         if (!response.ok) {
-            toastr.error(`${response.status} ${response.statusText}`, t`Failed to delete character`);
+            if (isBatch) failedNames.push(character.name);
+            else toastr.error(`${response.status} ${response.statusText}`, t`Failed to delete character`);
             continue;
         }
 
@@ -10876,7 +10970,8 @@ export async function deleteCharacter(characterKey, { deleteChats = true } = {})
         accountStorage.removeItem(`AlertRegex_${character.avatar}`);
         accountStorage.removeItem(`mediaWarningShown:${character.avatar}`);
         delete tag_map[character.avatar];
-        select_rm_info('char_delete', character.name);
+        deletedCount++;
+        if (!isBatch) select_rm_info('char_delete', character.name);
 
         if (deleteChats) {
             for (const chat of pastChats) {
@@ -10887,6 +10982,17 @@ export async function deleteCharacter(characterKey, { deleteChats = true } = {})
 
         await eventSource.emit(event_types.CHARACTER_DELETED, { id: chid, character: character });
         deleted = true;
+    }
+
+    if (isBatch) {
+        select_rm_info('char_delete_summary', '');
+        if (deletedCount > 0) {
+            toastr.warning(t`Deleted ${deletedCount} of ${characterKey.length} characters`, t`Bulk Delete`);
+        }
+        if (failedNames.length > 0) {
+            console.error('Characters that could not be deleted', failedNames);
+            toastr.error(summarizeNames(failedNames), t`Could not delete ${failedNames.length} characters`, { timeOut: 0, extendedTimeOut: 0 });
+        }
     }
 
     await removeCharacterFromUI();
@@ -12012,18 +12118,7 @@ jQuery(async function () {
             return;
         }
 
-        const avatarFileNames = [];
-        for (const file of e.target.files) {
-            const avatarFileName = await importCharacter(file);
-            if (avatarFileName !== undefined) {
-                avatarFileNames.push(avatarFileName);
-            }
-        }
-
-        if (avatarFileNames.length > 0) {
-            await importCharactersTags(avatarFileNames);
-            selectImportedChar(avatarFileNames[avatarFileNames.length - 1]);
-        }
+        await importCharacterFiles([...e.target.files]);
 
         // Clear the file input value to allow re-uploading the same file
         e.target.value = '';

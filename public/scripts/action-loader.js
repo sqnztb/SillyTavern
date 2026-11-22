@@ -263,6 +263,16 @@ export class ActionLoaderHandle {
     }
 
     /**
+     * Updates the message shown in this loader's toast, for example to report progress.
+     * @param {string} message - The new message
+     */
+    setMessage(message) {
+        if (this.#disposed) return;
+        const element = document.querySelector(`.action-loader-toast[data-loader-id="${this.#id}"] .action-loader-message`);
+        if (element) element.textContent = message;
+    }
+
+    /**
      * Triggers the stop action on this loader.
      * Calls the custom onStop handler if provided, otherwise calls stopGeneration().
      * Then hides this loader.

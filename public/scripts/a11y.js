@@ -84,19 +84,26 @@ const a11yRules = {
     },
 };
 
+const allRuleSelectors = Object.keys(a11yRules).join(', ');
+
 /**
  * Apply accessibility rules to an element.
  * @param {Element} element Element to process.
  */
 function applyA11yRules(element) {
     try {
+        // Most added elements have no matching descendants, so one query can skip a query per rule
+        const hasMatchingDescendants = element.querySelector(allRuleSelectors) !== null;
+
         for (const [selector, rule] of Object.entries(a11yRules)) {
             // Apply if the element directly matches the selector
             if (element.matches(selector)) {
                 rule(element);
             }
             // Apply the rule to descendants
-            element.querySelectorAll(selector).forEach(rule);
+            if (hasMatchingDescendants) {
+                element.querySelectorAll(selector).forEach(rule);
+            }
         }
     } catch (error) {
         console.error('Error applying accessibility rules to element:', element, error);

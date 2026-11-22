@@ -2243,12 +2243,19 @@ export function runAfterAnimation(control, callback, timeout = 500) {
 export function compareIgnoreCaseAndAccents(a, b, comparisonFunction) {
     if (!a || !b) return comparisonFunction(a, b); // Return the comparison result if either string is empty
 
-    // Normalize and remove diacritics, then convert to lower case
-    const normalizedA = a.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
-    const normalizedB = b.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
-
     // Check if the normalized strings are equal
-    return comparisonFunction(normalizedA, normalizedB);
+    return comparisonFunction(normalizeCaseAndAccents(a), normalizeCaseAndAccents(b));
+}
+
+/**
+ * Removes diacritics from a string and converts it to lower case.
+ * Two non-empty strings are equal under `equalsIgnoreCaseAndAccents` when their normalized forms match.
+ *
+ * @param {string} text - The text to normalize
+ * @returns {string} The normalized text
+ */
+export function normalizeCaseAndAccents(text) {
+    return text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 }
 
 /**

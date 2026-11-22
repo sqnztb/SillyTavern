@@ -175,8 +175,8 @@ function initializeInteractables(element = document) {
  * @returns {HTMLElement[]} An array containing all the interactables that match the given selectors
  */
 function getAllInteractables(element) {
-    // Query each selector individually and combine all to a big array to return
-    return [].concat(...interactableSelectors.map(selector => Array.from(element.querySelectorAll(`${selector}`))));
+    // Query all selectors at once. This runs for every added element, so separate queries add up quickly on large lists.
+    return Array.from(element.querySelectorAll(interactableSelectors.join(',')));
 }
 
 /**

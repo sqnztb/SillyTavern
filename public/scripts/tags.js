@@ -16,7 +16,7 @@ import {
 import { FILTER_TYPES, FILTER_STATES, DEFAULT_FILTER_STATE, isFilterState, FilterHelper } from './filters.js';
 
 import { groupCandidatesFilter, groupMembersFilter, groups, selected_group } from './group-chats.js';
-import { download, onlyUnique, parseJsonFile, uuidv4, getSortableDelay, flashHighlight, equalsIgnoreCaseAndAccents, includesIgnoreCaseAndAccents, removeFromArray, getFreeName, debounce, findChar, escapeHtml } from './utils.js';
+import { download, onlyUnique, parseJsonFile, uuidv4, getSortableDelay, flashHighlight, equalsIgnoreCaseAndAccents, includesIgnoreCaseAndAccents, normalizeCaseAndAccents, removeFromArray, getFreeName, debounce, findChar, escapeHtml } from './utils.js';
 import { power_user } from './power-user.js';
 import { SlashCommandParser } from './slash-commands/SlashCommandParser.js';
 import { SlashCommand } from './slash-commands/SlashCommand.js';
@@ -49,6 +49,7 @@ export {
     createTagMapFromList,
     renameTagKey,
     importTags,
+    importTagsForCharacters,
     sortTags,
     compareTagsForSort,
     removeTagFromMap,
@@ -989,6 +990,149 @@ async function importTags(character, { importSetting = null } = {}) {
 }
 
 /**
+ * Gets the names of the card tags that can still be imported for a character.
+ *
+ * @param {Character} character - The character
+ * @param {(name: string) => Tag?} findTag - Finds the existing tag for a name
+ * @returns {string[]} Tag names to import
+ */
+function getImportableTagNames(character, findTag) {
+    /** @type {string[]} */
+    const alreadyAssignedTags = tag_map[character.avatar] ?? [];
+    return (Array.isArray(character.tags) ? character.tags : []).map(t => t.trim()).filter(t => t)
+        .filter(t => !IMPORT_EXLCUDED_TAGS.includes(t))
+        .filter(t => {
+            const existingTag = findTag(t);
+            return !existingTag || !alreadyAssignedTags.includes(existingTag.id);
+        })
+        .slice(0, ANTI_TROLL_MAX_TAGS);
+}
+
+/**
+ * Imports card tags for many characters at once, asking at most once and reporting no per-character toasts.
+ * Tag names are resolved through one index, because scanning all tags per name is very slow on large libraries.
+ *
+ * @param {Character[]} characterList - The characters to import tags for
+ * @returns {Promise<number>} How many characters received at least one tag
+ */
+async function importTagsForCharacters(characterList) {
+    const configuredSetting = Object.values(tag_import_setting).find(setting => setting === power_user.tag_import_setting) ?? tag_import_setting.ASK;
+    if (configuredSetting === tag_import_setting.NONE) {
+        return 0;
+    }
+
+    /** @type {Map<string, Tag>} */
+    const tagsByName = new Map();
+    for (const tag of tags) {
+        if (typeof tag.name !== 'string' || !tag.name) continue;
+        const key = normalizeCaseAndAccents(tag.name);
+        if (!tagsByName.has(key)) tagsByName.set(key, tag);
+    }
+    const findTag = (/** @type {string} */ name) => tagsByName.get(normalizeCaseAndAccents(name));
+
+    const folderTags = getOpenBogusFolders();
+    const plans = characterList
+        .map(character => ({ character, names: getImportableTagNames(character, findTag) }))
+        .filter(plan => plan.names.length > 0 || folderTags.length > 0);
+    if (plans.length === 0) {
+        return 0;
+    }
+
+    let setting = configuredSetting;
+    if (setting === tag_import_setting.ASK) {
+        const uniqueNames = new Set(plans.flatMap(plan => plan.names.map(normalizeCaseAndAccents)));
+        const existingCount = [...uniqueNames].filter(name => tagsByName.has(name)).length;
+        setting = await showBulkTagImportPopup(plans.length, existingCount, uniqueNames.size - existingCount);
+        if (setting === tag_import_setting.NONE) {
+            return 0;
+        }
+    }
+
+    let taggedCharacters = 0;
+    for (const { character, names } of plans) {
+        const existingIds = [];
+        const missingNames = [];
+        for (const name of names) {
+            const tag = findTag(name);
+            if (tag) existingIds.push(tag.id);
+            else missingNames.push(name);
+        }
+
+        const newIds = [];
+        if (setting === tag_import_setting.ALL) {
+            for (const name of missingNames) {
+                const key = normalizeCaseAndAccents(name);
+                let tag = tagsByName.get(key);
+                if (!tag) {
+                    tag = newTag(name);
+                    tags.push(tag);
+                    tagsByName.set(key, tag);
+                }
+                newIds.push(tag.id);
+            }
+        }
+
+        const current = Array.isArray(tag_map[character.avatar]) ? tag_map[character.avatar] : [];
+        const currentCount = new Set(current).size;
+        const merged = new Set([...current, ...existingIds, ...newIds, ...folderTags.map(tag => tag.id)]);
+        if (merged.size > currentCount) {
+            tag_map[character.avatar] = [...merged];
+            taggedCharacters++;
+        }
+    }
+
+    if (taggedCharacters > 0) {
+        printCharactersDebounced();
+        saveSettingsDebounced();
+    }
+
+    return taggedCharacters;
+}
+
+/**
+ * Asks once how to handle the card tags of a multi-character import.
+ *
+ * @param {number} characterCount - Characters that have tags to import
+ * @param {number} existingCount - Distinct tags that already exist
+ * @param {number} newCount - Distinct tags that would be created
+ * @returns {Promise<tag_import_setting>} The chosen setting. Cancelling imports no tags.
+ */
+async function showBulkTagImportPopup(characterCount, existingCount, newCount) {
+    const buttonSettingsMap = {
+        [POPUP_RESULT.AFFIRMATIVE]: tag_import_setting.ALL,
+        [tag_import_setting.ONLY_EXISTING]: tag_import_setting.ONLY_EXISTING,
+        [tag_import_setting.NONE]: tag_import_setting.NONE,
+    };
+
+    const content = document.createElement('div');
+    const heading = document.createElement('h3');
+    heading.textContent = t`Import tags for ${characterCount} characters?`;
+    const details = document.createElement('div');
+    details.textContent = t`These cards use ${existingCount} tags you already have and ${newCount} new tags.`;
+    content.append(heading, details);
+
+    const result = await callGenericPopup(content, POPUP_TYPE.TEXT, null, {
+        okButton: t`Import All`,
+        cancelButton: true,
+        customButtons: [
+            { result: tag_import_setting.ONLY_EXISTING, text: t`Import Existing` },
+            { result: tag_import_setting.NONE, text: t`Import None` },
+        ],
+        customInputs: [{ id: 'import_remember_option', label: t`Remember my choice`, tooltip: t`Use this choice for all future imports. To change it, go to the settings and modify "Import Card Tags".` }],
+        onClose: (/** @type {Popup} */ popup) => {
+            const setting = buttonSettingsMap[popup.result];
+            if (setting && popup.inputResults.get('import_remember_option')) {
+                power_user.tag_import_setting = setting;
+                $('#tag_import_setting').val(power_user.tag_import_setting);
+                saveSettingsDebounced();
+            }
+        },
+    });
+
+    return buttonSettingsMap[result] ?? tag_import_setting.NONE;
+}
+
+/**
  * Handles the import of tags for a given character and returns the resulting list of tags to add
  *
  * @param {Character} character - The character
@@ -997,15 +1141,7 @@ async function importTags(character, { importSetting = null } = {}) {
  * @returns {Promise<string[]>} Array of strings representing the tags to import
  */
 async function handleTagImport(character, { importSetting = null } = {}) {
-    /** @type {string[]} */
-    const alreadyAssignedTags = tag_map[character.avatar] ?? [];
-    const importTags = character.tags.map(t => t.trim()).filter(t => t)
-        .filter(t => !IMPORT_EXLCUDED_TAGS.includes(t))
-        .filter(t => {
-            const existingTag = getTag(t);
-            return !existingTag || !alreadyAssignedTags.includes(existingTag.id);
-        })
-        .slice(0, ANTI_TROLL_MAX_TAGS);
+    const importTags = getImportableTagNames(character, getTag);
     const existingTags = getExistingTags(importTags);
     const newTags = importTags.filter(t => !existingTags.some(existingTag => existingTag.name.toLowerCase() === t.toLowerCase()))
         .map(newTag);
@@ -1232,6 +1368,10 @@ function printTagList(element, { tags = undefined, addTag = undefined, forEntity
     let additionalTagsPrinted = 0;
     let tagsSkipped = 0;
 
+    // Track printed ids up front, so large lists don't have to query the DOM once per tag
+    const printedTagIds = tagOptions.skipExistsCheck ? null : new Set($element.find('.tag').toArray().map(el => el.id));
+    const inactiveTagIds = new Set(inactiveTags);
+
     for (const tag of printableTags) {
         // If we have a custom action selector, we override that tag options for each tag
         if (customAction) {
@@ -1245,9 +1385,15 @@ function printTagList(element, { tags = undefined, addTag = undefined, forEntity
 
         // Check if we should print this tag
         if (shouldPrintTag(tag) || additionalTagsPrinted++ < availableSlotsForAdditionalTags) {
+            const printedId = String(tag.id);
+            if (printedTagIds?.has(printedId)) {
+                continue;
+            }
+            printedTagIds?.add(printedId);
+
             // Check if this tag is in the inactive list
-            const isInactive = inactiveTags.includes(tag.id);
-            appendTagToList($element, tag, { ...tagOptions, isInactive });
+            const isInactive = inactiveTagIds.has(tag.id);
+            appendTagToList($element, tag, { ...tagOptions, isInactive, skipExistsCheck: true });
         } else {
             tagsSkipped++;
         }
@@ -1546,18 +1692,15 @@ function printTagFilters(type = tag_filter_type.character) {
 
         if (visibleAvatars.length > 0) {
             // Get tags that are assigned to at least one visible character
-            const activeCharacterTagIds = visibleAvatars
-                .map(avatar => tag_map[avatar] || [])
-                .flat()
-                .filter(onlyUnique);
+            const activeCharacterTagIds = new Set(visibleAvatars.flatMap(avatar => tag_map[avatar] || []));
 
             // Show all tags that exist in the tag_map
-            const allCharacterTagIds = Object.values(tag_map).flat().filter(onlyUnique);
-            tagsToDisplay = tags.filter(x => allCharacterTagIds.includes(x.id)).sort(compareTagsForSort);
+            const allCharacterTagIds = new Set(Object.values(tag_map).flat());
+            tagsToDisplay = tags.filter(x => allCharacterTagIds.has(x.id)).sort(compareTagsForSort);
 
             // Mark tags that are not in the active set as inactive
             inactiveTags = tagsToDisplay
-                .filter(x => !activeCharacterTagIds.includes(x.id))
+                .filter(x => !activeCharacterTagIds.has(x.id))
                 .map(x => x.id);
         } else {
             // No group selected, show no tags
@@ -1565,8 +1708,8 @@ function printTagFilters(type = tag_filter_type.character) {
         }
     } else {
         // For main character list, show all tags as before
-        const characterTagIds = Object.values(tag_map).flat();
-        tagsToDisplay = tags.filter(x => characterTagIds.includes(x.id)).sort(compareTagsForSort);
+        const characterTagIds = new Set(Object.values(tag_map).flat());
+        tagsToDisplay = tags.filter(x => characterTagIds.has(x.id)).sort(compareTagsForSort);
     }
 
     printTagList($(FILTER_SELECTOR), { empty: false, tags: tagsToDisplay, tagOptions: { isFilter: true, isGeneralList: true }, inactiveTags: inactiveTags });
@@ -1753,13 +1896,29 @@ function makeTagListDraggable(tagContainer) {
         saveSettingsDebounced();
     };
 
+    // jQuery UI's sortable marks handles one at a time and re-sorts its whole tracked set on each,
+    // which takes over a minute with thousands of tags. This variant marks them all in one step.
     // @ts-ignore
-    $(tagContainer).sortable({
+    if (!$.fn.tagListSortable) {
+        // @ts-ignore
+        $.widget('st.tagListSortable', $.ui.sortable, {
+            widgetEventPrefix: 'sort',
+            _setHandleClassName() {
+                this.element.find(this.options.handle).addClass('ui-sortable-handle');
+            },
+        });
+    }
+
+    // @ts-ignore
+    $(tagContainer).tagListSortable({
         delay: getSortableDelay(),
         stop: () => onTagsSort(),
         handle: '.drag-handle',
     });
 }
+
+/** Shared collator. Orders strings like `localeCompare`, without its per-call locale lookup. */
+const tagNameCollator = new Intl.Collator();
 
 /**
  * Sorts the given tags, returning a shallow copy of it
@@ -1782,18 +1941,18 @@ function sortTags(tags, counts = null) {
  */
 function compareTagsForSort(a, b, counts = null) {
     // default sort: alphabetical, case insensitive
-    const defaultSort = a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+    const defaultSort = () => tagNameCollator.compare(a.name.toLowerCase(), b.name.toLowerCase());
 
     // sort on number of entries
     if (power_user.tag_sort_mode === tag_sort_mode.BY_ENTRIES) {
         const aCount = counts instanceof Map ? (counts.get(a.id) || 0) : 0;
         const bCount = counts instanceof Map ? (counts.get(b.id) || 0) : 0;
-        return (bCount - aCount) || defaultSort;
+        return (bCount - aCount) || defaultSort();
     }
 
     // alphabetical sort
     if (power_user.tag_sort_mode === tag_sort_mode.ALPHABETICAL) {
-        return defaultSort;
+        return defaultSort();
     }
 
     // manual sort
@@ -1804,7 +1963,7 @@ function compareTagsForSort(a, b, counts = null) {
     } else if (b.sort_order !== undefined) {
         return 1;
     } else {
-        return defaultSort;
+        return defaultSort();
     }
 }
 
@@ -2277,8 +2436,12 @@ function copyTags(data) {
  */
 function printViewTagList(tagContainer, empty = true) {
     if (empty) tagContainer.empty();
-    const everything = Object.values(tag_map).flat();
-    const counts = new Map(tags.map(tag => [tag.id, everything.filter(x => x === tag.id).length]));
+    const counts = new Map(tags.map(tag => [tag.id, 0]));
+    for (const tagId of Object.values(tag_map).flat()) {
+        if (counts.has(tagId)) {
+            counts.set(tagId, counts.get(tagId) + 1);
+        }
+    }
     const sortedTags = sortTags(tags, counts);
     for (const tag of sortedTags) {
         const count = counts.get(tag.id) || 0;

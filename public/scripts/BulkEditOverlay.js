@@ -110,10 +110,11 @@ class CharacterContextMenu {
      *
      * @param {string|string[]} characterKey
      * @param {boolean} [deleteChats]
+     * @param {((done: number, total: number) => void)?} [onProgress] Called after each processed character
      * @returns {Promise<void>}
      */
-    static delete = async (characterKey, deleteChats = false) => {
-        await deleteCharacter(characterKey, { deleteChats: deleteChats });
+    static delete = async (characterKey, deleteChats = false, onProgress = null) => {
+        await deleteCharacter(characterKey, { deleteChats: deleteChats, onProgress: onProgress });
     };
 
     static #getCharacter = (characterId) => characters[characterId] ?? null;
@@ -854,7 +855,8 @@ class BulkEditOverlay {
                     toastMode: loader.ToastMode.STATIC,
                 });
                 const avatarList = characterIds.map(id => characters[id]?.avatar).filter(a => a);
-                return CharacterContextMenu.delete(avatarList, deleteChats)
+                const onProgress = (done, total) => loaderHandle.setMessage(t`Deleting ${done} of ${total} character(s)…`);
+                return CharacterContextMenu.delete(avatarList, deleteChats, onProgress)
                     .then(() => this.browseState())
                     .finally(() => loaderHandle.hide());
             });
