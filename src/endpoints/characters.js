@@ -9,10 +9,12 @@ import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import yaml from 'yaml';
 import _ from 'lodash';
 import mime from 'mime-types';
-import { Jimp, JimpMime } from '../jimp.js';
+import { Jimp } from '../jimp.js';
 import storage from 'node-persist';
 
-import { AVATAR_WIDTH, AVATAR_HEIGHT, DEFAULT_AVATAR_PATH } from '../constants.js';
+import { DEFAULT_AVATAR_PATH } from '../constants.js';
+import { applyAvatarCropResize } from '../avatar-image.js';
+import { composeCardImage, prepareCardImport } from '../card-import-pool.js';
 import { default as validateAvatarUrlMiddleware, getFileNameValidationFunction, forbiddenRegExp } from '../middleware/validateFileName.js';
 import { deepMerge, humanizedDateTime, tryParse, MemoryLimitedMap, getConfigValue, mutateJsonString, clientRelativePath, getUniqueName, sanitizeSafeCharacterReplacements, getArrayBufferSlice } from '../util.js';
 import { TavernCardValidator } from '../validator/TavernCardValidator.js';
@@ -215,9 +217,10 @@ async function readCharacterData(inputFile, inputFormat = 'png') {
  * @param {string} outputFile - Target image file name
  * @param {import('express').Request} request - Express request obejct
  * @param {Crop|undefined} crop - Crop parameters
+ * @param {Buffer|null} [preparedImage] - Image already normalized by a worker, which replaces reading the input file
  * @returns {Promise<boolean>} - True if the operation was successful
  */
-async function writeCharacterData(inputFile, data, outputFile, request, crop = undefined) {
+async function writeCharacterData(inputFile, data, outputFile, request, crop = undefined, preparedImage = null) {
     try {
         // Reset the cache
         for (const key of memoryCache.keys()) {
@@ -250,10 +253,10 @@ async function writeCharacterData(inputFile, data, outputFile, request, crop = u
             }
         }
 
-        const inputImage = await getInputImage();
-
         // Get the chunks
-        const outputImage = write(inputImage, data);
+        const outputImage = preparedImage
+            ? (await composeCardImage(preparedImage, data)) ?? write(preparedImage, data)
+            : write(await getInputImage(), data);
         const outputImagePath = path.join(request.user.directories.characters, `${outputFile}.png`);
 
         writeFileAtomicSync(outputImagePath, outputImage);
@@ -273,37 +276,7 @@ async function writeCharacterData(inputFile, data, outputFile, request, crop = u
  * @property {boolean} want_resize Resize the image to the standard avatar size
  */
 
-/**
- * Applies avatar crop and resize operations to an image.
- * I couldn't fix the type issue, so the first argument has {any} type.
- * @param {object} jimp Jimp image instance
- * @param {Crop|undefined} [crop] Crop parameters
- * @returns {Promise<Buffer>} Processed image buffer
- */
-export async function applyAvatarCropResize(jimp, crop) {
-    if (!(jimp instanceof Jimp)) {
-        throw new TypeError('Expected a Jimp instance');
-    }
-
-    const image = /** @type {InstanceType<typeof Jimp>} */ (jimp);
-    let finalWidth = image.bitmap.width, finalHeight = image.bitmap.height;
-
-    // Apply crop if defined
-    if (typeof crop == 'object' && [crop.x, crop.y, crop.width, crop.height].every(x => typeof x === 'number')) {
-        image.crop({ x: crop.x, y: crop.y, w: crop.width, h: crop.height });
-        // Apply standard resize if requested
-        if (crop.want_resize) {
-            finalWidth = AVATAR_WIDTH;
-            finalHeight = AVATAR_HEIGHT;
-        } else {
-            finalWidth = crop.width;
-            finalHeight = crop.height;
-        }
-    }
-
-    image.cover({ w: finalWidth, h: finalHeight });
-    return await image.getBuffer(JimpMime.png);
-}
+export { applyAvatarCropResize };
 
 /**
  * Parses an image buffer and applies crop if defined.
@@ -962,12 +935,12 @@ async function importFromJson(uploadPath, { request }, preservedFileName) {
 /**
  * Import a character from a PNG file.
  * @param {string} uploadPath Path to the uploaded file
- * @param {{ request: import('express').Request, response: import('express').Response }} context Express request and response objects
+ * @param {{ request: import('express').Request, response: import('express').Response, prepared?: { cardData: string, image: Buffer }|null }} context Express request and response objects, and any work already done by a worker
  * @param {string|undefined} preservedFileName Preserved file name
  * @returns {Promise<string>} Internal name of the character
  */
-async function importFromPng(uploadPath, { request }, preservedFileName) {
-    const imgData = await readCharacterData(uploadPath);
+async function importFromPng(uploadPath, { request, prepared = null }, preservedFileName) {
+    const imgData = prepared?.cardData ?? await readCharacterData(uploadPath);
     if (imgData === undefined) throw new Error('Failed to read character data');
 
     let jsonData = JSON.parse(imgData);
@@ -985,7 +958,7 @@ async function importFromPng(uploadPath, { request }, preservedFileName) {
         jsonData = readFromV2(jsonData);
         jsonData.create_date = new Date().toISOString();
         const char = JSON.stringify(jsonData);
-        const result = await writeCharacterData(uploadPath, char, pngName, request);
+        const result = await writeCharacterData(uploadPath, char, pngName, request, undefined, prepared?.image);
         fs.unlinkSync(uploadPath);
         return result ? pngName : '';
     } else if (jsonData.name !== undefined) {
@@ -1012,7 +985,7 @@ async function importFromPng(uploadPath, { request }, preservedFileName) {
         };
         char = convertToV2(char, request.user.directories);
         const charJSON = JSON.stringify(char);
-        const result = await writeCharacterData(uploadPath, charJSON, pngName, request);
+        const result = await writeCharacterData(uploadPath, charJSON, pngName, request, undefined, prepared?.image);
         fs.unlinkSync(uploadPath);
         return result ? pngName : '';
     }
@@ -1558,6 +1531,32 @@ function getPreservedName(request) {
         : undefined;
 }
 
+/**
+ * The last import in line for each characters folder.
+ * @type {Map<string, Promise<void>>}
+ */
+const importQueues = new Map();
+
+/**
+ * Runs imports for a characters folder one at a time, in the order they arrived.
+ * Importers pick a free file name and then create it, so overlapping imports of
+ * same-named cards could otherwise overwrite each other.
+ * @template T
+ * @param {string} key Characters folder
+ * @param {() => Promise<T>} task The import
+ * @returns {Promise<T>} The import result
+ */
+function runInImportOrder(key, task) {
+    const previous = importQueues.get(key) ?? Promise.resolve();
+    const result = previous.then(task);
+    const tail = result.then(() => { }, () => { });
+    importQueues.set(key, tail);
+    tail.then(() => {
+        if (importQueues.get(key) === tail) importQueues.delete(key);
+    });
+    return result;
+}
+
 router.post('/import', async function (request, response) {
     if (!request.body || !request.file) return response.sendStatus(400);
 
@@ -1581,7 +1580,11 @@ router.post('/import', async function (request, response) {
             throw new Error(`Unsupported format: ${format}`);
         }
 
-        const fileName = await importFunction(uploadPath, { request, response }, preservedFileName);
+        // Heavy work for bulk imports starts on another core right away, while the import waits for its turn
+        const preparedWork = request.body.bulk === 'true' && format === 'png' ? prepareCardImport(uploadPath) : Promise.resolve(null);
+        const fileName = await runInImportOrder(request.user.directories.characters, async () => {
+            return await importFunction(uploadPath, { request, response, prepared: await preparedWork }, preservedFileName);
+        });
 
         if (!fileName) {
             console.warn('Failed to import character');

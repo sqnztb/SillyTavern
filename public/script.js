@@ -10504,19 +10504,25 @@ function summarizeNames(names, limit = 5) {
     return names.length > limit ? `${shown} ${t`and ${names.length - limit} more`}` : shown;
 }
 
+/** How many cards a bulk import uploads at once. Browsers allow six connections per host. */
+const BULK_IMPORT_CONCURRENCY = 6;
+
 /**
- * Imports character files one at a time, then their tags. Multiple files share one progress
- * toast and one summary instead of notifying per file. Uploads stay sequential on purpose:
- * the server picks a free file name before writing, so same-named cards must not overlap.
+ * Imports character files, then their tags. Multiple files upload in parallel and share one
+ * progress toast and one summary instead of notifying per file. The server still assigns
+ * file names one at a time, so same-named cards can't overwrite each other.
  * @param {File[]} files Files to import
  * @param {Map<File, string>} [data] Preserved file names, by file
  * @returns {Promise<void>}
  */
 async function importCharacterFiles(files, data = new Map()) {
     const isBatch = files.length > 1;
-    const avatarFileNames = [];
-    const failedNames = [];
+    /** @type {({ avatar: string|undefined }|undefined)[]} */
+    const results = new Array(files.length);
     let stopRequested = false;
+    let nextIndex = 0;
+    let finishedCount = 0;
+    let abortError = null;
 
     const loaderHandle = isBatch ? loader.show({
         blocking: false,
@@ -10527,22 +10533,39 @@ async function importCharacterFiles(files, data = new Map()) {
         onStop: () => { stopRequested = true; },
     }) : loader.Handle.EMPTY;
 
-    try {
-        for (const [index, file] of files.entries()) {
-            if (stopRequested) break;
-            loaderHandle.setMessage(t`Importing ${index + 1} of ${files.length} characters…`);
-
+    const importNextFiles = async () => {
+        while (!stopRequested && !abortError && nextIndex < files.length) {
+            const index = nextIndex++;
+            const file = files[index];
             const preservedName = data instanceof Map && data.get(file);
-            const avatarFileName = await importCharacter(file, { preserveFileName: preservedName, quiet: isBatch });
-            if (avatarFileName !== undefined) {
-                avatarFileNames.push(avatarFileName);
-            } else {
-                failedNames.push(file.name);
+
+            try {
+                const avatar = await importCharacter(file, { preserveFileName: preservedName, quiet: isBatch });
+                results[index] = { avatar };
+            } catch (error) {
+                abortError ??= error;
+                return;
             }
+
+            finishedCount++;
+            loaderHandle.setMessage(t`Importing ${Math.min(finishedCount + 1, files.length)} of ${files.length} characters…`);
         }
+    };
+
+    try {
+        const uploadSlots = isBatch ? Math.min(BULK_IMPORT_CONCURRENCY, files.length) : 1;
+        await Promise.all(Array.from({ length: uploadSlots }, importNextFiles));
     } finally {
         await loaderHandle.hide();
     }
+
+    if (abortError) {
+        throw abortError;
+    }
+
+    // Keep the original file order, regardless of which upload finished first
+    const avatarFileNames = results.filter(result => result?.avatar !== undefined).map(result => result.avatar);
+    const failedNames = files.filter((_, index) => results[index] && results[index].avatar === undefined).map(file => file.name);
 
     if (avatarFileNames.length > 0) {
         if (isBatch) $('#character_search_bar').val('').trigger('input');
@@ -10627,6 +10650,7 @@ async function importCharacter(file, { preserveFileName = '', importTags = false
     formData.append('file_type', format);
     formData.append('user_name', name1);
     if (preserveFileName) formData.append('preserved_name', preserveFileName);
+    if (quiet) formData.append('bulk', 'true');
 
     try {
         const result = await fetch('/api/characters/import', {
